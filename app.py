@@ -1,23 +1,54 @@
 import streamlit as st
 import pandas as pd
 from datetime import datetime
-from streamlit_gsheets import GSheetsConnection
+import gspread
+from google.oauth2.service_account import Credentials
 
 st.set_page_config(page_title="Gestão", layout="centered")
 st.title("Controle de Materiais do Laboratório")
 
-# 1. CRIANDO A CONEXÃO COM O GOOGLE SHEETS
+# 1. CRIANDO A CONEXÃO COM O GOOGLE SHEETS VIA GSPREAD
+@st.cache_resource
+def conectar_gsheets():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+    # Pega as credenciais direto dos Secrets do Streamlit Cloud ou local
+    creds_dict = dict(st.secrets["connections"]["gsheets"])
+    # Ajusta o formato da chave privada para evitar erros de PEM
+    if "private_key" in creds_dict:
+        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+    
+    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+    client = gspread.authorize(creds)
+    
+    # Pega a URL da planilha dos secrets
+    spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
+    return client.open_by_url(spreadsheet_url)
 
-conn = st.connection("gsheets", type=GSheetsConnection)
+try:
+    sh = conectar_gsheets()
+except Exception as e:
+    st.error(f"❌ Erro ao conectar com o Google Sheets: {e}")
+    st.stop()
 
 # 2. FUNÇÃO PARA CARREGAR OS DADOS DA NUVEM
-
 def carregar_dados():
-    st.session_state.estoque = conn.read(worksheet="Estoque")
-    st.session_state.hist_retiradas = conn.read(worksheet="Retiradas")
-    st.session_state.hist_pagamentos = conn.read(worksheet="Pagamentos")
+    try:
+        ws_estoque = sh.worksheet("Estoque")
+        ws_retiradas = sh.worksheet("Retiradas")
+        ws_pagamentos = sh.worksheet("Pagamentos")
+        
+        st.session_state.estoque = pd.DataFrame(ws_estoque.get_all_records())
+        st.session_state.hist_retiradas = pd.DataFrame(ws_retiradas.get_all_records())
+        st.session_state.hist_pagamentos = pd.DataFrame(ws_pagamentos.get_all_records())
+    except Exception:
+        # Se as abas estiverem vazias ou com cabeçalho
+        st.session_state.estoque = pd.DataFrame(columns=['Material', 'Unidade', 'Preço Unitário (R$)', 'Qtd em Estoque'])
+        st.session_state.hist_retiradas = pd.DataFrame(columns=['Data', 'Aluno', 'Material', 'Qtd Retirada', 'Valor (R$)'])
+        st.session_state.hist_pagamentos = pd.DataFrame(columns=['Data', 'Aluno', 'Valor Pago (R$)'])
 
-    # Garante que não carregue nulos se a planilha estiver recém-criada/vazia
     if st.session_state.estoque.empty:
         st.session_state.estoque = pd.DataFrame(columns=['Material', 'Unidade', 'Preço Unitário (R$)', 'Qtd em Estoque'])
     if st.session_state.hist_retiradas.empty:
@@ -27,9 +58,21 @@ def carregar_dados():
 
 # 3. FUNÇÃO PARA SALVAR OS DADOS NA NUVEM
 def salvar_banco():
-    conn.update(worksheet="Estoque", data=st.session_state.estoque)
-    conn.update(worksheet="Retiradas", data=st.session_state.hist_retiradas)
-    conn.update(worksheet="Pagamentos", data=st.session_state.hist_pagamentos)
+    try:
+        def atualizar_aba(nome_aba, df):
+            try:
+                ws = sh.worksheet(nome_aba)
+            except:
+                ws = sh.add_worksheet(title=nome_aba, rows="100", cols="20")
+            ws.clear()
+            dados = [df.columns.tolist()] + df.fillna("").values.tolist()
+            ws.update(dados)
+
+        atualizar_aba("Estoque", st.session_state.estoque)
+        atualizar_aba("Retiradas", st.session_state.hist_retiradas)
+        atualizar_aba("Pagamentos", st.session_state.hist_pagamentos)
+    except Exception as e:
+        st.error(f"Erro ao salvar na nuvem: {e}")
 
 # Executa o carregamento apenas na primeira vez que a página abre
 if 'dados_carregados' not in st.session_state:
@@ -52,7 +95,7 @@ with aba_retirar:
     st.subheader("Nova Retirada")
     
     if st.session_state.estoque.empty:
-        st.warning("⚠️ O estoque está vazio! é necessário cadastrar os primeiros materiais.")
+        st.warning("⚠️ O estoque está vazio! É necessário cadastrar os primeiros materiais.")
     else:
         aluno = st.text_input("Nome:")
         
@@ -109,7 +152,6 @@ with aba_retirar:
                     
                     st.session_state.estoque.at[idx_material, 'Qtd em Estoque'] = qtd_atual - quantidade
                     
-                    # Salva no Google Sheets
                     salvar_banco()
                     
                     st.success(f"✅ Registrado! {quantidade} {unidade} de {material_escolhido} para {aluno}. Valor total: R$ {valor_total:.2f}")
@@ -139,7 +181,6 @@ with aba_admin:
             if st.button("Voltar ao Login"):
                 st.session_state.modo_recuperacao = False
                 st.rerun()
-        
         else:
             st.subheader("🔒 Acesso Restrito")
             st.write("Insira a senha de administrador para editar o estoque e ver o caixa.")
@@ -279,18 +320,24 @@ with aba_historicos:
 
         st.subheader("⚠️ Resumo de Saldos (Quem deve o quê)")
         
-        total_gasto = st.session_state.hist_retiradas.groupby('Aluno')['Valor (R$)'].sum().reset_index()
-        total_gasto.rename(columns={'Valor (R$)': 'Total Gasto (R$)'}, inplace=True)
-        
-        total_pago = st.session_state.hist_pagamentos.groupby('Aluno')['Valor Pago (R$)'].sum().reset_index()
-        
+        if not st.session_state.hist_retiradas.empty:
+            total_gasto = st.session_state.hist_retiradas.groupby('Aluno')['Valor (R$)'].sum().reset_index()
+            total_gasto.rename(columns={'Valor (R$)': 'Total Gasto (R$)'}, inplace=True)
+        else:
+            total_gasto = pd.DataFrame(columns=['Aluno', 'Total Gasto (R$)'])
+            
+        if not st.session_state.hist_pagamentos.empty:
+            total_pago = st.session_state.hist_pagamentos.groupby('Aluno')['Valor Pago (R$)'].sum().reset_index()
+        else:
+            total_pago = pd.DataFrame(columns=['Aluno', 'Valor Pago (R$)'])
+            
         if not total_gasto.empty or not total_pago.empty:
             resumo = pd.merge(total_gasto, total_pago, on='Aluno', how='outer').fillna(0)
             
             if 'Total Gasto (R$)' not in resumo.columns:
                 resumo['Total Gasto (R$)'] = 0.0
             if 'Valor Pago (R$)' not in resumo.columns:
-                resumo['Valor Pago (R$)'] = 0.0
+                resumo['Valor Pago (R$)'} = 0.0
                 
             resumo['Falta Pagar (R$)'] = resumo['Total Gasto (R$)'] - resumo['Valor Pago (R$)']
             
