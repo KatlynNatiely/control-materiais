@@ -16,6 +16,7 @@ def conectar_gsheets():
     ]
     # Pega as credenciais direto dos Secrets do Streamlit Cloud ou local
     creds_dict = dict(st.secrets["connections"]["gsheets"])
+    spreadsheet_url = creds_dict.pop("spreadsheet")
     # Ajusta o formato da chave privada para evitar erros de PEM
     if "private_key" in creds_dict:
         creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
@@ -24,7 +25,6 @@ def conectar_gsheets():
     client = gspread.authorize(creds)
     
     # Pega a URL da planilha dos secrets
-    spreadsheet_url = st.secrets["connections"]["gsheets"]["spreadsheet"]
     return client.open_by_url(spreadsheet_url)
 
 try:
@@ -337,7 +337,7 @@ with aba_historicos:
             if 'Total Gasto (R$)' not in resumo.columns:
                 resumo['Total Gasto (R$)'] = 0.0
             if 'Valor Pago (R$)' not in resumo.columns:
-                resumo['Valor Pago (R$)'} = 0.0
+                resumo['Valor Pago (R$)'] = 0.0
                 
             resumo['Falta Pagar (R$)'] = resumo['Total Gasto (R$)'] - resumo['Valor Pago (R$)']
             
